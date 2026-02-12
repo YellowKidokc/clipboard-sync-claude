@@ -82,6 +82,9 @@ import {
 } from "@/components/ui/popover";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
+import { useQuery } from "@tanstack/react-query";
+import { apiRequest, queryClient } from "@/lib/queryClient";
+import { AppNav } from "@/components/app-nav";
 
 interface StructuredField {
   id: string;
@@ -89,6 +92,25 @@ interface StructuredField {
   value: string;
   type: "text" | "password" | "url" | "email" | "phone" | "date" | "api_key";
   icon: string;
+}
+
+interface ApiClip {
+  id: string;
+  content_type: string;
+  text_content: string | null;
+  blob_url: string | null;
+  tags: string[];
+  title?: string;
+  category?: ClipItem["category"];
+  structured?: boolean;
+  structured_fields?: StructuredField[];
+  folder_id?: string | null;
+  is_pinned: boolean;
+  is_starred: boolean;
+  is_deleted: boolean;
+  hotkey_slot?: number | null;
+  created_at: string;
+  updated_at?: string | null;
 }
 
 interface ClipItem {
@@ -103,6 +125,38 @@ interface ClipItem {
   deleted: boolean;
   isStructured: boolean;
   fields: StructuredField[];
+}
+
+function deriveTitleFromContent(text: string) {
+  const first = text.split("\n").find((line) => line.trim().length > 0);
+  return first ? first.slice(0, 80) : "Untitled";
+}
+
+function mapApiClip(clip: ApiClip): ClipItem {
+  const content = clip.text_content || "";
+  return {
+    id: clip.id,
+    title: clip.title || deriveTitleFromContent(content),
+    content,
+    timestamp: new Date(clip.created_at),
+    pinned: clip.is_pinned,
+    starred: clip.is_starred,
+    category: clip.category || "clipboard",
+    tags: clip.tags || [],
+    deleted: clip.is_deleted,
+    isStructured: Boolean(clip.structured) || (clip.structured_fields?.length ?? 0) > 0,
+    fields: clip.structured_fields || [],
+  };
+}
+
+function buildTagsPayload(clip: ClipItem) {
+  return {
+    labels: clip.tags,
+    title: clip.title,
+    category: clip.category,
+    structured: clip.isStructured,
+    fields: clip.fields,
+  };
 }
 
 interface HotkeyConfig {
@@ -316,6 +370,40 @@ export default function ClipboardPage() {
   const [newFieldType, setNewFieldType] = useState<StructuredField["type"]>("text");
   const inputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
+  const { data: clipsData, isLoading: clipsLoading } = useQuery<{ items: ApiClip[] }>({
+    queryKey: ["/api/clips?limit=200&include_deleted=true"],
+  });
+
+  useEffect(() => {
+    if (clipsData?.items) {
+      setClips(clipsData.items.map(mapApiClip));
+    }
+  }, [clipsData]);
+
+  const updateClipState = (updated: ClipItem) => {
+    setClips((prev) => prev.map((clip) => (clip.id === updated.id ? updated : clip)));
+    if (selectedClip?.id === updated.id) {
+      setSelectedClip(updated);
+    }
+  };
+
+  const createClipOnServer = async (payload: Record<string, unknown>) => {
+    const res = await apiRequest("POST", "/api/clips", payload);
+    const json = (await res.json()) as ApiClip;
+    const mapped = mapApiClip(json);
+    setClips((prev) => [mapped, ...prev]);
+    queryClient.invalidateQueries({ queryKey: ["/api/clips?limit=200&include_deleted=true"] });
+    return mapped;
+  };
+
+  const updateClipOnServer = async (id: string, payload: Record<string, unknown>) => {
+    const res = await apiRequest("PUT", `/api/clips/${id}`, payload);
+    const json = (await res.json()) as ApiClip;
+    const mapped = mapApiClip(json);
+    updateClipState(mapped);
+    queryClient.invalidateQueries({ queryKey: ["/api/clips?limit=200&include_deleted=true"] });
+    return mapped;
+  };
 
   const allTags = Array.from(new Set(clips.flatMap(c => c.tags))).filter(Boolean);
 
@@ -379,6 +467,7 @@ export default function ClipboardPage() {
     }
     try {
       await navigator.clipboard.writeText(textToCopy);
+      await apiRequest("POST", `/api/clips/${clip.id}/copy`);
       setCopiedId(clip.id);
       toast({ title: "Copied" });
       setTimeout(() => setCopiedId(null), 2000);
@@ -387,51 +476,79 @@ export default function ClipboardPage() {
     }
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!selectedClip) return;
-    setClips(clips.map(clip => 
-      clip.id === selectedClip.id 
-        ? { ...clip, content: editingContent, title: editingTitle, fields: editingFields, timestamp: new Date() }
-        : clip
-    ));
-    setSelectedClip({ ...selectedClip, content: editingContent, title: editingTitle, fields: editingFields });
-    toast({ title: "Saved" });
+    const updatedClip: ClipItem = {
+      ...selectedClip,
+      content: editingContent,
+      title: editingTitle,
+      fields: editingFields,
+      timestamp: new Date(),
+    };
+    try {
+      await updateClipOnServer(selectedClip.id, {
+        text_content: editingContent,
+        tags: buildTagsPayload(updatedClip),
+      });
+      toast({ title: "Saved" });
+    } catch (err) {
+      toast({ title: "Failed to save", variant: "destructive" });
+    }
   };
 
-  const handleDelete = (id: string) => {
-    setClips(clips.map(clip => 
-      clip.id === id ? { ...clip, deleted: true } : clip
-    ));
-    if (selectedClip?.id === id) setSelectedClip(null);
-    toast({ title: "Moved to Recycle Bin" });
+  const handleDelete = async (id: string) => {
+    try {
+      const updated = await updateClipOnServer(id, { is_deleted: true });
+      setClips((prev) => prev.map((clip) => (clip.id === id ? updated : clip)));
+      if (selectedClip?.id === id) setSelectedClip(null);
+      toast({ title: "Moved to Recycle Bin" });
+    } catch {
+      toast({ title: "Failed to delete", variant: "destructive" });
+    }
   };
 
-  const handleRestore = (id: string) => {
-    setClips(clips.map(clip => 
-      clip.id === id ? { ...clip, deleted: false } : clip
-    ));
-    toast({ title: "Restored" });
+  const handleRestore = async (id: string) => {
+    try {
+      const updated = await updateClipOnServer(id, { is_deleted: false });
+      setClips((prev) => prev.map((clip) => (clip.id === id ? updated : clip)));
+      toast({ title: "Restored" });
+    } catch {
+      toast({ title: "Failed to restore", variant: "destructive" });
+    }
   };
 
-  const handlePermanentDelete = (id: string) => {
-    setClips(clips.filter(clip => clip.id !== id));
-    if (selectedClip?.id === id) setSelectedClip(null);
-    toast({ title: "Permanently deleted" });
+  const handlePermanentDelete = async (id: string) => {
+    try {
+      await apiRequest("DELETE", `/api/clips/${id}`);
+      setClips((prev) => prev.filter((clip) => clip.id !== id));
+      if (selectedClip?.id === id) setSelectedClip(null);
+      toast({ title: "Permanently deleted" });
+    } catch {
+      toast({ title: "Failed to delete", variant: "destructive" });
+    }
   };
 
-  const handleStar = (id: string) => {
-    setClips(clips.map(clip => 
-      clip.id === id ? { ...clip, starred: !clip.starred } : clip
-    ));
+  const handleStar = async (id: string) => {
+    const target = clips.find((clip) => clip.id === id);
+    if (!target) return;
+    try {
+      await updateClipOnServer(id, { is_starred: !target.starred, tags: buildTagsPayload(target) });
+    } catch {
+      toast({ title: "Failed to update", variant: "destructive" });
+    }
   };
 
-  const handlePin = (id: string) => {
-    setClips(clips.map(clip => 
-      clip.id === id ? { ...clip, pinned: !clip.pinned } : clip
-    ));
+  const handlePin = async (id: string) => {
+    const target = clips.find((clip) => clip.id === id);
+    if (!target) return;
+    try {
+      await updateClipOnServer(id, { is_pinned: !target.pinned, tags: buildTagsPayload(target) });
+    } catch {
+      toast({ title: "Failed to update", variant: "destructive" });
+    }
   };
 
-  const handleNewNote = (category: ClipItem["category"] = "notes", isStructured = false) => {
+  const handleNewNote = async (category: ClipItem["category"] = "notes", isStructured = false) => {
     const newClip: ClipItem = {
       id: Date.now().toString(),
       title: category === "prompts" ? "New Prompt" : isStructured ? "New Structured Note" : "Untitled Note",
@@ -443,16 +560,25 @@ export default function ClipboardPage() {
       tags: [],
       deleted: false,
       isStructured,
-      fields: isStructured ? [
-        { id: "f1", label: "Field 1", value: "", type: "text", icon: "text" }
-      ] : []
+      fields: isStructured
+        ? [{ id: \"f1\", label: \"Field 1\", value: \"\", type: \"text\", icon: \"text\" }]
+        : [],
     };
-    setClips([newClip, ...clips]);
-    setSelectedClip(newClip);
-    setEditingTitle(newClip.title);
-    setEditingContent("");
-    setEditingFields(newClip.fields);
-    setShowAIChat(false);
+    try {
+      const created = await createClipOnServer({
+        content_type: "text/plain",
+        text_content: "",
+        tags: buildTagsPayload(newClip),
+        source: "manual",
+      });
+      setSelectedClip(created);
+      setEditingTitle(created.title);
+      setEditingContent(created.content);
+      setEditingFields(created.fields);
+      setShowAIChat(false);
+    } catch {
+      toast({ title: "Failed to create", variant: "destructive" });
+    }
   };
 
   const handleAddField = () => {
@@ -480,80 +606,63 @@ export default function ClipboardPage() {
     ));
   };
 
-  const handleSelectWorkflow = (workflow: AIWorkflow) => {
+  const handleSelectWorkflow = async (workflow: AIWorkflow) => {
     setAiPrompt("");
     setShowWorkflowMenu(false);
-    
-    const context = selectedClip ? `\n\nContext from "${selectedClip.title}":\n${selectedClip.content}` : "";
-    const fullPrompt = workflow.prompt + context;
-    
-    setAiMessages([...aiMessages, { role: "user", content: `${workflow.command} - ${workflow.name}` }]);
+    if (!selectedClip) {
+      toast({ title: "Select a clip first", variant: "destructive" });
+      return;
+    }
+
+    setAiMessages((prev) => [...prev, { role: "user", content: `${workflow.command} - ${workflow.name}` }]);
     setAiLoading(true);
-    
-    setTimeout(() => {
-      let response = "";
-      switch (workflow.id) {
-        case "w1":
-          response = selectedClip 
-            ? `Here's a summary of "${selectedClip.title}":\n\n• Key points extracted from your note\n• Main action items identified\n• Core concepts highlighted for quick reference`
-            : "Please select a note first, then I can summarize it for you.";
-          break;
-        case "w2":
-          response = "I've analyzed the text. Here are my suggestions:\n\n1. Consider breaking long sentences into shorter ones\n2. Use more active voice\n3. Add transition words between paragraphs\n\nWould you like me to rewrite it?";
-          break;
-        case "w3":
-          response = "Based on the content, I suggest these tags:\n\n#documentation #reference #important\n\nWould you like me to apply them?";
-          break;
-        case "w4":
-          response = "Code review complete:\n\n✅ Syntax looks good\n⚠️ Consider adding error handling\n💡 Variable naming could be more descriptive\n\nWant me to suggest specific improvements?";
-          break;
-        case "w5":
-          response = "I can help draft an email. Please provide:\n\n1. Who is the recipient?\n2. What's the main purpose?\n3. What tone? (formal/casual)\n\nOr just describe what you need!";
-          break;
-        case "w6":
-          response = "Here are some ideas to brainstorm:\n\n💡 Expand on the core concept\n💡 Consider alternative approaches\n💡 Look for connections to other projects\n💡 What problems does this solve?\n\nWhat direction interests you most?";
-          break;
-        default:
-          response = "Workflow executed. How can I help you further?";
-      }
-      setAiMessages(prev => [...prev, { role: "assistant", content: response }]);
+
+    try {
+      const workflowId = workflow.command.startsWith("/") ? workflow.command.slice(1) : workflow.command;
+      const res = await apiRequest("POST", "/api/ai/workflow", {
+        clip_id: selectedClip.id,
+        workflow: workflowId,
+      });
+      const data = (await res.json()) as { output: string };
+      setAiMessages((prev) => [...prev, { role: "assistant", content: data.output }]);
+    } catch (err) {
+      setAiMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "Unable to run workflow. Check server connection." },
+      ]);
+    } finally {
       setAiLoading(false);
-    }, 1200);
+    }
   };
 
-  const handleAISubmit = () => {
+  const handleAISubmit = async () => {
     if (!aiPrompt.trim()) return;
-    
+
     if (showWorkflowMenu && filteredWorkflows.length > 0) {
       handleSelectWorkflow(filteredWorkflows[0]);
       return;
     }
-    
+
     const userMessage = aiPrompt;
-    setAiMessages([...aiMessages, { role: "user", content: userMessage }]);
+    setAiMessages((prev) => [...prev, { role: "user", content: userMessage }]);
     setAiPrompt("");
     setAiLoading(true);
 
-    setTimeout(() => {
-      let response = "";
-      const lowerMsg = userMessage.toLowerCase();
-      
-      if (lowerMsg.includes("list") && (lowerMsg.includes("note") || lowerMsg.includes("clip"))) {
-        const noteList = clips.filter(c => !c.deleted).slice(0, 5).map(c => `• ${c.title}`).join("\n");
-        response = `Here are your recent items:\n\n${noteList}\n\nWould you like me to do something with any of these?`;
-      } else if (lowerMsg.includes("find") || lowerMsg.includes("search")) {
-        response = `I can search through your ${clips.filter(c => !c.deleted).length} items. What are you looking for specifically?`;
-      } else if (lowerMsg.includes("help")) {
-        response = "I can help you with:\n\n• /summarize - Summarize notes\n• /improve - Improve writing\n• /tags - Suggest tags\n• /code - Code review\n• /email - Draft emails\n• /ideas - Brainstorm\n\nOr just ask me anything about your notes!";
-      } else if (selectedClip) {
-        response = `I see you have "${selectedClip.title}" selected. I can help you:\n\n• Summarize it\n• Improve the writing\n• Suggest tags\n• Find related items\n\nWhat would you like me to do?`;
-      } else {
-        response = "I'm ready to help! You can:\n\n• Select a note and ask me to work with it\n• Use /commands for quick workflows\n• Ask me to find or organize your content\n\nWhat would you like to do?";
-      }
-      
-      setAiMessages(prev => [...prev, { role: "assistant", content: response }]);
+    try {
+      const res = await apiRequest("POST", "/api/ai/chat", {
+        message: userMessage,
+        clip_id: selectedClip?.id,
+      });
+      const data = (await res.json()) as { response: string };
+      setAiMessages((prev) => [...prev, { role: "assistant", content: data.response }]);
+    } catch {
+      setAiMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "AI request failed. Check server connection." },
+      ]);
+    } finally {
       setAiLoading(false);
-    }, 1000);
+    }
   };
 
   const getCategoryCount = (cat: SidebarCategory): number => {
@@ -588,9 +697,11 @@ export default function ClipboardPage() {
   };
 
   return (
-    <div className="h-screen bg-background flex overflow-hidden">
-      {/* Left Sidebar */}
-      <aside className="w-56 border-r border-border/50 bg-sidebar flex flex-col">
+    <div className="min-h-screen bg-background flex flex-col">
+      <AppNav />
+      <div className="flex-1 flex overflow-hidden">
+        {/* Left Sidebar */}
+        <aside className="w-56 border-r border-border/50 bg-sidebar flex flex-col">
         <div className="p-3 border-b border-border/50">
           <div className="flex items-center gap-2 px-2">
             <div className="w-7 h-7 rounded-md bg-primary/20 flex items-center justify-center">
@@ -836,7 +947,14 @@ export default function ClipboardPage() {
               </motion.div>
             ))}
 
-            {filteredClips.length === 0 && (
+            {clipsLoading && (
+              <div className="py-12 text-center">
+                <Loader2 className="w-8 h-8 mx-auto mb-2 animate-spin text-muted-foreground/50" />
+                <p className="text-sm text-muted-foreground">Loading clips...</p>
+              </div>
+            )}
+
+            {!clipsLoading && filteredClips.length === 0 && (
               <div className="py-12 text-center">
                 <Inbox className="w-8 h-8 mx-auto mb-2 text-muted-foreground/50" />
                 <p className="text-sm text-muted-foreground">No items found</p>
@@ -1245,10 +1363,11 @@ export default function ClipboardPage() {
         </SheetContent>
       </Sheet>
 
-      {/* Full Settings Page */}
-      {showSettings && (
-        <SettingsPage onClose={() => setShowSettings(false)} />
-      )}
+        {/* Full Settings Page */}
+        {showSettings && (
+          <SettingsPage onClose={() => setShowSettings(false)} />
+        )}
+      </div>
     </div>
   );
 }
