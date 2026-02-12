@@ -561,7 +561,7 @@ export default function ClipboardPage() {
       deleted: false,
       isStructured,
       fields: isStructured
-        ? [{ id: \"f1\", label: \"Field 1\", value: \"\", type: \"text\", icon: \"text\" }]
+        ? [{ id: "f1", label: "Field 1", value: "", type: "text", icon: "text" }]
         : [],
     };
     try {

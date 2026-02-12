@@ -1,12 +1,17 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 
+; ── Config ──────────────────────────────────────────────────────────────
+; Change this to your NAS IP once the server is deployed there
 API_BASE := "http://localhost:5000"
 API_KEY := ""
 ignoreClipboard := false
 
+; ── Clipboard Monitor ───────────────────────────────────────────────────
 OnClipboardChange(ClipboardChanged)
 
+; ── Hotkeys ─────────────────────────────────────────────────────────────
+; Ctrl+Alt+1-12: Paste from hotkey slot
 ^!1::PasteFromSlot(1)
 ^!2::PasteFromSlot(2)
 ^!3::PasteFromSlot(3)
@@ -20,261 +25,194 @@ OnClipboardChange(ClipboardChanged)
 ^!-::PasteFromSlot(11)
 ^!=::PasteFromSlot(12)
 
+; Ctrl+Alt+S: Save current clipboard to next available slot
 ^!s::SaveClipboardToNextSlot()
+; Ctrl+Alt+P: Show AI prediction
 ^!p::ShowPrediction()
+; Ctrl+Alt+Space: Open web UI in browser
 ^!Space::Run(API_BASE)
 
+; ── Tray Menu ───────────────────────────────────────────────────────────
+A_TrayMenu.Delete()
+A_TrayMenu.Add("Open ClipSync Web UI", (*) => Run(API_BASE))
+A_TrayMenu.Add()
+A_TrayMenu.Add("Show Prediction (Ctrl+Alt+P)", (*) => ShowPrediction())
+A_TrayMenu.Add("Save to Slot (Ctrl+Alt+S)", (*) => SaveClipboardToNextSlot())
+A_TrayMenu.Add()
+A_TrayMenu.Add("Reload", (*) => Reload())
+A_TrayMenu.Add("Exit", (*) => ExitApp())
+A_TrayMenu.Default := "Open ClipSync Web UI"
+TraySetIcon("shell32.dll", 44)
+A_IconTip := "ClipSync - Clipboard Monitor"
+
+; Show startup notification
+TrayTip "ClipSync is running`nCtrl+Alt+1-12 to paste from slots`nCtrl+Alt+S to save to slot", "ClipSync", 0x1
+SetTimer () => TrayTip(), -3000
+
+; ── Clipboard Changed Handler ───────────────────────────────────────────
 ClipboardChanged(type) {
-  global ignoreClipboard
-  if (ignoreClipboard)
-    return
-  if (type != 1)
-    return
+    global ignoreClipboard
+    if (ignoreClipboard)
+        return
+    if (type != 1)  ; Only text
+        return
 
-  text := A_Clipboard
-  if (text = "")
-    return
+    text := A_Clipboard
+    if (text = "")
+        return
 
-  payload := Map(
-    "content_type", "text/plain",
-    "text_content", text,
-    "source", "clipboard_monitor"
-  )
-  HttpPost("/api/clips", payload)
+    body := '{"content_type":"text/plain","text_content":' . JsonEscape(text) . ',"source":"clipboard_monitor"}'
+    try {
+        HttpPost("/api/clips", body)
+    }
 }
 
+; ── Paste From Slot ─────────────────────────────────────────────────────
 PasteFromSlot(slot) {
-  global ignoreClipboard
-  response := HttpGet("/api/clips/hotkeys")
-  if (response = "")
-    return
-  data := Jxon_Load(response)[1]
-  if !data.Has("slots")
-    return
-  if !data["slots"].Has(String(slot))
-    return
-  clip := data["slots"][String(slot)]
-  text := clip.Has("text_content") ? clip["text_content"] : ""
-  if (text = "")
-    return
-  ignoreClipboard := true
-  A_Clipboard := text
-  Send "^v"
-  Sleep 100
-  ignoreClipboard := false
+    global ignoreClipboard
+    try {
+        response := HttpGet("/api/clips/hotkeys")
+        if (response = "")
+            return
+    } catch {
+        ToolTip "ClipSync server not reachable"
+        SetTimer () => ToolTip(), -1500
+        return
+    }
+
+    ; Parse the response to find the slot
+    ; Look for the slot's text_content in the JSON response
+    slotText := ExtractSlotText(response, slot)
+    if (slotText = "")
+        return
+
+    ignoreClipboard := true
+    A_Clipboard := slotText
+    Send "^v"
+    Sleep 100
+    ignoreClipboard := false
+    ToolTip "Pasted slot " . slot
+    SetTimer () => ToolTip(), -800
 }
 
+; ── Save To Next Slot ───────────────────────────────────────────────────
 SaveClipboardToNextSlot() {
-  response := HttpGet("/api/clips/hotkeys")
-  data := response != "" ? Jxon_Load(response)[1] : Map()
-  slots := data.Has("slots") ? data["slots"] : Map()
+    text := A_Clipboard
+    if (text = "")
+        return
 
-  nextSlot := 0
-  Loop 12 {
-    slot := A_Index
-    if !slots.Has(String(slot)) {
-      nextSlot := slot
-      break
+    ; Find next available slot (1-12)
+    try {
+        response := HttpGet("/api/clips/hotkeys")
+    } catch {
+        response := ""
     }
-  }
-  if (nextSlot = 0) {
-    ToolTip "All slots are full"
-    SetTimer () => ToolTip(""), -1500
-    return
-  }
 
-  text := A_Clipboard
-  if (text = "")
-    return
-
-  payload := Map(
-    "content_type", "text/plain",
-    "text_content", text,
-    "hotkey_slot", nextSlot,
-    "source", "clipboard_monitor"
-  )
-  HttpPost("/api/clips", payload)
-  ToolTip "Saved to slot " . nextSlot
-  SetTimer () => ToolTip(""), -1200
-}
-
-ShowPrediction() {
-  response := HttpGet("/api/predictions/current")
-  if (response = "")
-    return
-  data := Jxon_Load(response)[1]
-  prediction := data.Has("prediction") ? data["prediction"] : ""
-  confidence := data.Has("confidence") ? Round(data["confidence"] * 100) : 0
-  ToolTip "Prediction: " . prediction . " (" . confidence . "%)"
-  SetTimer () => ToolTip(""), -2000
-}
-
-HttpGet(path) {
-  global API_BASE, API_KEY
-  req := ComObject("WinHttp.WinHttpRequest.5.1")
-  req.Open("GET", API_BASE . path, false)
-  if (API_KEY != "")
-    req.SetRequestHeader("x-api-key", API_KEY)
-  req.Send()
-  return req.ResponseText
-}
-
-HttpPost(path, payload) {
-  global API_BASE, API_KEY
-  req := ComObject("WinHttp.WinHttpRequest.5.1")
-  req.Open("POST", API_BASE . path, false)
-  req.SetRequestHeader("Content-Type", "application/json")
-  if (API_KEY != "")
-    req.SetRequestHeader("x-api-key", API_KEY)
-  body := Jxon_Dump(payload)
-  req.Send(body)
-  return req.ResponseText
-}
-
-; Jxon library (minimal)
-Jxon_Load(ByRef src, args*) {
-  static q := Chr(34), ws := " `t`r`n", true := 1, false := 0, null := ""
-  if !IsSet(args[1])
-    args := [0, 0]
-  pos := 1 + args[1]
-  ch := SubStr(src, pos, 1)
-  while InStr(ws, ch) {
-    pos++
-    ch := SubStr(src, pos, 1)
-  }
-  if (ch = q) {
-    pos++
-    val := ""
-    loop {
-      ch := SubStr(src, pos, 1)
-      if (ch = q) {
-        pos++
-        break
-      } else if (ch = "\") {
-        pos++
-        ch := SubStr(src, pos, 1)
-        if (ch = "u") {
-          hex := SubStr(src, pos + 1, 4)
-          val .= Chr("0x" . hex)
-          pos += 5
-          continue
+    nextSlot := 1
+    if (response != "") {
+        Loop 12 {
+            slotText := ExtractSlotText(response, A_Index)
+            if (slotText = "") {
+                nextSlot := A_Index
+                break
+            }
+            if (A_Index = 12)
+                nextSlot := 0
         }
-      }
-      val .= ch
-      pos++
     }
-  } else if (ch = "{") {
-    obj := Map()
-    pos++
-    loop {
-      ch := SubStr(src, pos, 1)
-      while InStr(ws, ch) {
-        pos++
-        ch := SubStr(src, pos, 1)
-      }
-      if (ch = "}") {
-        pos++
-        break
-      }
-      key := Jxon_Load(src, pos)
-      pos := key[2]
-      ch := SubStr(src, pos, 1)
-      while InStr(ws, ch) {
-        pos++
-        ch := SubStr(src, pos, 1)
-      }
-      pos++
-      val := Jxon_Load(src, pos)
-      pos := val[2]
-      obj[key[1]] := val[1]
-      ch := SubStr(src, pos, 1)
-      while InStr(ws, ch) {
-        pos++
-        ch := SubStr(src, pos, 1)
-      }
-      if (ch = ",") {
-        pos++
-        continue
-      } else if (ch = "}") {
-        pos++
-        break
-      }
+
+    if (nextSlot = 0) {
+        ToolTip "All 12 slots are full!"
+        SetTimer () => ToolTip(), -1500
+        return
     }
-    val := obj
-  } else if (ch = "[") {
-    arr := []
-    pos++
-    loop {
-      ch := SubStr(src, pos, 1)
-      while InStr(ws, ch) {
-        pos++
-        ch := SubStr(src, pos, 1)
-      }
-      if (ch = "]") {
-        pos++
-        break
-      }
-      val := Jxon_Load(src, pos)
-      pos := val[2]
-      arr.Push(val[1])
-      ch := SubStr(src, pos, 1)
-      while InStr(ws, ch) {
-        pos++
-        ch := SubStr(src, pos, 1)
-      }
-      if (ch = ",") {
-        pos++
-        continue
-      } else if (ch = "]") {
-        pos++
-        break
-      }
+
+    body := '{"content_type":"text/plain","text_content":' . JsonEscape(text) . ',"hotkey_slot":' . nextSlot . ',"source":"clipboard_monitor"}'
+    try {
+        HttpPost("/api/clips", body)
+        ToolTip "Saved to slot " . nextSlot
+        SetTimer () => ToolTip(), -1200
+    } catch {
+        ToolTip "Failed to save"
+        SetTimer () => ToolTip(), -1500
     }
-    val := arr
-  } else if RegExMatch(SubStr(src, pos), "^-?\d+(\.\d+)?([eE][+-]?\d+)?", &m) {
-    val := m[0] + 0
-    pos += StrLen(m[0])
-  } else if SubStr(src, pos, 4) = "true" {
-    val := true
-    pos += 4
-  } else if SubStr(src, pos, 5) = "false" {
-    val := false
-    pos += 5
-  } else if SubStr(src, pos, 4) = "null" {
-    val := null
-    pos += 4
-  }
-  return [val, pos]
 }
 
-Jxon_Dump(obj, indent := "") {
-  if (IsObject(obj)) {
-    if (obj is Array) {
-      out := "["
-      for idx, val in obj {
-        if (idx > 1)
-          out .= ","
-        out .= Jxon_Dump(val, indent)
-      }
-      return out "]"
+; ── Show Prediction ─────────────────────────────────────────────────────
+ShowPrediction() {
+    try {
+        response := HttpGet("/api/predictions/current")
+        if (response = "")
+            return
+
+        ; Extract prediction text and confidence from JSON
+        prediction := ExtractJsonString(response, "prediction")
+        confidence := ExtractJsonNumber(response, "confidence")
+        pct := Round(confidence * 100)
+
+        if (prediction = "") {
+            ToolTip "No prediction available"
+        } else {
+            ToolTip "AI Prediction (" . pct . "%):`n" . SubStr(prediction, 1, 200)
+        }
+        SetTimer () => ToolTip(), -3000
+    } catch {
+        ToolTip "Could not reach prediction engine"
+        SetTimer () => ToolTip(), -1500
     }
-    out := "{"
-    idx := 0
-    for key, val in obj {
-      if (idx > 0)
-        out .= ","
-      out .= "\"" . key . "\":" . Jxon_Dump(val, indent)
-      idx++
-    }
-    return out "}"
-  }
-  if (obj is Number)
-    return obj
-  if (obj = "")
-    return "\"\""
-  escaped := StrReplace(obj, "\", "\\")
-  escaped := StrReplace(escaped, "\"", "\\\"")
-  escaped := StrReplace(escaped, "`r", "\\r")
-  escaped := StrReplace(escaped, "`n", "\\n")
-  return "\"" . escaped . "\""
+}
+
+; ── HTTP Helpers ────────────────────────────────────────────────────────
+HttpGet(path) {
+    global API_BASE, API_KEY
+    req := ComObject("WinHttp.WinHttpRequest.5.1")
+    req.Open("GET", API_BASE . path, false)
+    if (API_KEY != "")
+        req.SetRequestHeader("x-api-key", API_KEY)
+    req.Send()
+    return req.ResponseText
+}
+
+HttpPost(path, body) {
+    global API_BASE, API_KEY
+    req := ComObject("WinHttp.WinHttpRequest.5.1")
+    req.Open("POST", API_BASE . path, false)
+    req.SetRequestHeader("Content-Type", "application/json")
+    if (API_KEY != "")
+        req.SetRequestHeader("x-api-key", API_KEY)
+    req.Send(body)
+    return req.ResponseText
+}
+
+; ── JSON Helpers (simple, no external lib needed) ───────────────────────
+JsonEscape(str) {
+    str := StrReplace(str, "\", "\\")
+    str := StrReplace(str, "`"", "\`"")
+    str := StrReplace(str, "`n", "\n")
+    str := StrReplace(str, "`r", "\r")
+    str := StrReplace(str, "`t", "\t")
+    return "`"" . str . "`""
+}
+
+ExtractJsonString(json, key) {
+    needle := "`"" . key . "`"`s*:`s*`""
+    if RegExMatch(json, needle . "(.*?)`"", &m)
+        return m[1]
+    return ""
+}
+
+ExtractJsonNumber(json, key) {
+    needle := "`"" . key . "`"`s*:`s*(-?[\d.]+)"
+    if RegExMatch(json, needle, &m)
+        return m[1] + 0
+    return 0
+}
+
+ExtractSlotText(json, slot) {
+    ; Look for "hotkey_slot":N followed by "text_content":"..."
+    ; This is a simplified parser for the hotkeys endpoint response
+    needle := "`"hotkey_slot`"`s*:`s*" . slot . ".*?`"text_content`"`s*:`s*`"(.*?)`""
+    if RegExMatch(json, "s)" . needle, &m)
+        return StrReplace(StrReplace(m[1], "\n", "`n"), "\\", "\")
+    return ""
 }
